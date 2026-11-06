@@ -1,3 +1,4 @@
+
 import json
 import datetime as dt
 from pathlib import Path
@@ -5,196 +6,485 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-import db
 
-ART = Path(__file__).parent / "artifacts"
-KIGALI = dt.timezone(dt.timedelta(hours=2), "CAT")        # Kigali, Rwanda: UTC+2 all year (no daylight saving)
+BASE = Path(__file__).parent
+ART = BASE / "artifacts"
+DATA = BASE / "data"
+
+KIGALI = dt.timezone(dt.timedelta(hours=2), "CAT")
 
 
 def kigali_now():
-    """Current time in Kigali. The hosted server runs on UTC, so dt.datetime.now() would be 2 hours behind."""
+    """Return the current Kigali time."""
     return dt.datetime.now(KIGALI).replace(tzinfo=None)
 
 
-st.set_page_config(page_title="Smart Waste-Bin", page_icon="🗑️", layout="centered")
+st.set_page_config(
+    page_title="Smart Waste-Bin",
+    page_icon="🗑️",
+    layout="wide"
+)
 
 
 @st.cache_data
 def load_metrics():
-    return json.load(open(ART / "metrics.json"))
+    path = ART / "metrics.json"
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
 
 
-def predict_hours(metrics, fill, weight, now, last_collection):
-    """Multiple Linear Regression: intercept + sum(coefficient * feature). Uses the numbers saved in metrics.json."""
-    hours_since = max((now - last_collection).total_seconds() / 3600, metrics.get("min_hours", 1))
-    x = {
+@st.cache_data
+def load_dataset():
+    """Load the cleaned dataset if it exists."""
+    candidates = [
+        DATA / "cleaned_waste_data.csv",
+        DATA / "cleaned_dataset.csv",
+        BASE / "cleaned_waste_data.csv",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return pd.read_csv(path), path.name
+
+    return None, None
+
+
+def predict_hours(metrics, fill, now, last_collection):
+    """Predict hours until the configured collection level."""
+
+    hours_since = max(
+        (now - last_collection).total_seconds() / 3600,
+        metrics.get("min_hours", 1)
+    )
+
+    features = {
         "fill_pct": fill,
-        "weight_kg": weight,
         "hours_since_collection": hours_since,
         "avg_fill_rate": fill / hours_since,
         "hour": now.hour,
         "is_weekend": int(now.weekday() >= 5),
     }
-    prediction = metrics["intercept"] + sum(coef * x[name] for name, coef in metrics["coefficients"].items())
+
+    coefficients = metrics.get("coefficients", {})
+
+    # Do not invent a weight value if the trained model requires one.
+    unsupported = [
+        name for name in coefficients
+        if name not in features
+    ]
+
+    if unsupported:
+        raise ValueError(
+            "The saved model requires features not provided by this app: "
+            + ", ".join(unsupported)
+            + ". Retrain the model using the available sensor features."
+        )
+
+    prediction = metrics["intercept"] + sum(
+        coefficients[name] * features[name]
+        for name in coefficients
+    )
+
     return max(float(prediction), 0.0), hours_since
 
 
 st.title("🗑️ Smart Waste-Bin System")
+
 st.caption(
-    "Shows how much room is left in the bin and predicts when it reaches "
-    "the collection level (Multiple Linear Regression)."
+    "Monitor ultrasonic bin fill levels and estimate when a bin "
+    "will reach its collection threshold."
 )
 
-if not (ART / "metrics.json").exists():
-    st.error("Model not found. Run the training notebook first so it creates the `artifacts/` folder.")
+metrics_path = ART / "metrics.json"
+
+if not metrics_path.exists():
+    st.error(
+        "Model metrics not found. Add artifacts/metrics.json "
+        "to your GitHub repository."
+    )
     st.stop()
 
-metrics = load_metrics()
-FULL_LEVEL = metrics.get("full_level_pct", 80)
+try:
+    metrics = load_metrics()
+except Exception as exc:
+    st.error(f"Could not load model metrics: {exc}")
+    st.stop()
+
+
+FULL_LEVEL = float(metrics.get("full_level_pct", 80))
+SOON_LEVEL = max(FULL_LEVEL - 15, 0)
+
 if "history" not in st.session_state:
     st.session_state.history = []
 
-tab1, tab2, tab3 = st.tabs(["Predict", "Model and data", "Admin"])
+
+tab1, tab2, tab3 = st.tabs(
+    ["Predict", "Model and data", "Dataset explorer"]
+)
+
+
+# --------------------------------------------------
+# TAB 1: PREDICTION
+# --------------------------------------------------
 
 with tab1:
-    CAP_KG = float(metrics.get("bin_capacity_kg", 200))
-    SOON_LEVEL = FULL_LEVEL - 15
+    st.subheader("Bin fill prediction")
 
-    weight = st.number_input(f"Current weight in the bin (kg). The bin holds {CAP_KG:.0f} kg when 100% full.",
-                             0.0, CAP_KG, 40.0, step=1.0)
-    fill = round(weight / CAP_KG * 100, 1)                       # the fill level is calculated from the weight
-    f1, f2 = st.columns(2)
-    f1.metric("Current fill level (automatic)", f"{fill:.1f} %")
-    f2.metric("Collection level", f"{FULL_LEVEL:.0f} %  ({FULL_LEVEL / 100 * CAP_KG:.0f} kg)")
-    st.progress(min(fill / 100, 1.0), text=f"{weight:.0f} kg of {CAP_KG:.0f} kg")
+    fill = st.number_input(
+        "Current ultrasonic fill level (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=40.0,
+        step=1.0
+    )
 
-    st.markdown("**Current collection (the current level of the waste in the bin)**")
-    st.caption(f"Current time in Kigali: {kigali_now():%a %d %b %Y, %H:%M}")
-    if "default_last" not in st.session_state:                 # fixed once per visit, so the inputs are not reset
-        st.session_state.default_last = kigali_now().replace(second=0, microsecond=0) - dt.timedelta(hours=24)
-        st.session_state.default_now_time = kigali_now().time().replace(second=0, microsecond=0)
+    col1, col2 = st.columns(2)
+
+    col1.metric("Current fill level", f"{fill:.1f}%")
+    col2.metric("Collection threshold", f"{FULL_LEVEL:.0f}%")
+
+    st.progress(
+        min(fill / 100, 1.0),
+        text=f"{fill:.1f}% of bin capacity"
+    )
+
+    st.markdown("**Collection timing**")
+    st.caption(
+        f"Current Kigali time: "
+        f"{kigali_now():%a %d %b %Y, %H:%M}"
+    )
+
+    if "default_last" not in st.session_state:
+        st.session_state.default_last = (
+            kigali_now().replace(second=0, microsecond=0)
+            - dt.timedelta(hours=24)
+        )
+
+    if "default_now_time" not in st.session_state:
+        st.session_state.default_now_time = (
+            kigali_now().time().replace(second=0, microsecond=0)
+        )
+
     d1, d2 = st.columns(2)
-    last_date = d1.date_input("Date", st.session_state.default_last.date())
-    last_time = d2.time_input("Time", st.session_state.default_last.time())
 
-    use_now = st.checkbox("Use current Kigali time as 'now'", value=True)
+    last_date = d1.date_input(
+        "Last collection date",
+        value=st.session_state.default_last.date()
+    )
+
+    last_time = d2.time_input(
+        "Last collection time",
+        value=st.session_state.default_last.time()
+    )
+
+    use_now = st.checkbox(
+        "Use current Kigali time",
+        value=True
+    )
+
     if use_now:
         now = kigali_now()
     else:
         n1, n2 = st.columns(2)
-        now = dt.datetime.combine(n1.date_input("Now: date", kigali_now().date()),
-                                  n2.time_input("Now: time", st.session_state.default_now_time))
+
+        selected_date = n1.date_input(
+            "Current date",
+            value=kigali_now().date()
+        )
+
+        selected_time = n2.time_input(
+            "Current time",
+            value=st.session_state.default_now_time
+        )
+
+        now = dt.datetime.combine(selected_date, selected_time)
+
     last_collection = dt.datetime.combine(last_date, last_time)
 
-    if st.button("Predict remaining level", type="primary"):
+    if st.button("Predict collection time", type="primary"):
+
         if last_collection >= now:
             st.error("The last collection must be before the current time.")
+
         else:
-            remaining = max(FULL_LEVEL - fill, 0.0)                  # % left before the collection level
-            free_space = max(100 - fill, 0.0)                        # % of the whole bin still empty
-            r1, r2 = st.columns(2)
-            r1.metric(f"Level remaining before collection ({FULL_LEVEL:.0f}%)", f"{remaining:.1f} %")
-            r1.caption(f"about {remaining / 100 * CAP_KG:.0f} kg more can be added")
-            r2.metric("Free space in the bin", f"{free_space:.1f} %")
-            r2.caption(f"about {free_space / 100 * CAP_KG:.0f} kg of {CAP_KG:.0f} kg")
+            remaining = max(FULL_LEVEL - fill, 0.0)
+            free_space = max(100 - fill, 0.0)
+
+            c1, c2 = st.columns(2)
+
+            c1.metric(
+                "Fill remaining before collection",
+                f"{remaining:.1f}%"
+            )
+
+            c2.metric(
+                "Total empty space",
+                f"{free_space:.1f}%"
+            )
+
             if fill >= FULL_LEVEL:
-                st.error(f"The bin reached the {FULL_LEVEL:.0f}% collection level. Collect now.")
+                st.error(
+                    f"The bin has reached the {FULL_LEVEL:.0f}% "
+                    "collection threshold. Collect it now."
+                )
+
             elif fill >= SOON_LEVEL:
-                st.warning("Collect soon: the bin is close to the collection level.")
+                st.warning(
+                    "The bin is approaching the collection threshold. "
+                    "Plan collection soon."
+                )
+
             else:
-                st.success("No collection needed yet.")
-                hours, since = predict_hours(metrics, fill, weight, now, last_collection)
-                h, m = int(hours), int(round((hours % 1) * 60))
-                st.caption(f"Model estimate (Multiple Linear Regression): about {h} h {m} min until the bin "
-                           f"reaches the {FULL_LEVEL:.0f}% collection level.")
+                try:
+                    hours, _ = predict_hours(
+                        metrics,
+                        fill,
+                        now,
+                        last_collection
+                    )
+
+                    whole_hours = int(hours)
+                    minutes = int(round((hours % 1) * 60))
+
+                    if minutes == 60:
+                        whole_hours += 1
+                        minutes = 0
+
+                    st.success(
+                        f"Estimated time until collection threshold: "
+                        f"{whole_hours} hours and {minutes} minutes."
+                    )
+
+                    st.caption(
+                        "This is a machine-learning estimate, "
+                        "not a guaranteed collection time."
+                    )
+
+                except ValueError as exc:
+                    st.error(str(exc))
+
             st.session_state.history.append({
-                "Time": f"{now:%d %b %H:%M}", "Weight kg": weight, "Fill %": fill, "Remaining %": round(remaining, 1)})
+                "Time": now.strftime("%d %b %Y %H:%M"),
+                "Fill (%)": round(fill, 1),
+                "Remaining (%)": round(remaining, 1),
+            })
 
     if st.session_state.history:
-        st.markdown("**This session**")
-        st.dataframe(pd.DataFrame(st.session_state.history), hide_index=True)
+        st.divider()
+        st.markdown("**Prediction history for this session**")
+
+        history_df = pd.DataFrame(st.session_state.history)
+
+        st.dataframe(
+            history_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download session history (CSV)",
+            history_df.to_csv(index=False),
+            file_name="prediction_history.csv",
+            mime="text/csv"
+        )
+
+        if st.button("Clear session history"):
+            st.session_state.history = []
+            st.rerun()
+
+
+# --------------------------------------------------
+# TAB 2: MODEL AND DATA
+# --------------------------------------------------
 
 with tab2:
-    st.write(f"**Data source:** {metrics['data_source']}  |  **Rows used:** {metrics['rows']}")
-    st.write(f"**Weight:** {metrics['weight']}")
-    st.write(f"Bin capacity: **{metrics.get('bin_capacity_kg', 200):.0f} kg** (= 100% fill). Collection level: **{FULL_LEVEL:.0f}%**.")
-    if metrics.get("calibrated"):
-        st.caption(f"Fill % means percent of the bin's capacity. In this dataset a sensor reading of "
-                   f"{metrics['raw_capacity_pct']}% (the bin's usual weekly peak) counts as 100%.")
-    st.markdown("**Test-set results (hours)**")
-    st.dataframe(pd.DataFrame({"Baseline (fill % only)": metrics["baseline"],
-                               "MLR (all features)": metrics["mlr"],
-                               "Ridge": metrics["ridge"]}).T)
-    st.markdown("**Regression equation coefficients**")
-    st.dataframe(pd.Series(metrics["coefficients"], name="coefficient").round(4).to_frame())
-    st.caption(f"Intercept: {metrics['intercept']:.3f}")
-    for img in ("eda.png", "evaluation.png"):
-        if (ART / img).exists():
-            st.image(str(ART / img))
+    st.subheader("Model information")
+
+    info1, info2, info3 = st.columns(3)
+
+    info1.metric(
+        "Dataset rows",
+        f"{metrics.get('rows', 'N/A'):,}"
+        if isinstance(metrics.get("rows"), int)
+        else str(metrics.get("rows", "N/A"))
+    )
+
+    info2.metric(
+        "Collection threshold",
+        f"{FULL_LEVEL:.0f}%"
+    )
+
+    info3.metric(
+        "Model",
+        "Multiple Linear Regression"
+    )
+
+    st.markdown("**Data source**")
+    st.write(metrics.get("data_source", "Not specified"))
+
+    st.markdown("**Training information**")
+    st.write(metrics.get("weight", "Not specified"))
+
+    st.markdown("**Test-set evaluation**")
+
+    evaluation = {
+        "Baseline (fill % only)": metrics.get("baseline", {}),
+        "Multiple Linear Regression": metrics.get("mlr", {}),
+        "Ridge Regression": metrics.get("ridge", {}),
+    }
+
+    st.dataframe(
+        pd.DataFrame(evaluation).T,
+        use_container_width=True
+    )
+
+    st.markdown("**Regression coefficients**")
+
+    coefficients = metrics.get("coefficients", {})
+
+    if coefficients:
+        coefficient_df = pd.DataFrame(
+            list(coefficients.items()),
+            columns=["Feature", "Coefficient"]
+        )
+
+        st.dataframe(
+            coefficient_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.caption(
+        f"Model intercept: {metrics.get('intercept', 'N/A')}"
+    )
+
+    st.markdown("**Model evaluation charts**")
+
+    for image_name in ("eda.png", "evaluation.png"):
+        image_path = ART / image_name
+
+        if image_path.exists():
+            st.image(str(image_path), caption=image_name)
+
+    st.caption(
+        "The metrics and coefficients shown here are loaded from "
+        "artifacts/metrics.json."
+    )
+
+
+# --------------------------------------------------
+# TAB 3: DATASET EXPLORER
+# --------------------------------------------------
 
 with tab3:
-    st.subheader("Database access")
-    state = db.status()
-    mode = state["mode"]
+    st.subheader("Cleaned dataset explorer")
 
-    if mode == "error":
-        st.error(f"The database is configured but not working: {state['message']}")
-        st.caption("The Predict and Model tabs still work. Check DATABASE_URL in the app's Secrets.")
+    dataset, dataset_name = load_dataset()
+
+    if dataset is None:
+        st.warning(
+            "No cleaned dataset was found. Add your cleaned CSV file "
+            "to the data/ folder in your GitHub repository."
+        )
+
     else:
-        if mode == "sqlite":
-            st.info("Demo mode: PostgreSQL is not connected, so this tab shows the bundled read-only copy of the data "
-                    "and a downloadable CSV file. There is no sign-up: log in with the admin credentials saved in "
-                    "the app's Secrets.")
-        can_login = mode == "postgres" or db.demo_login_configured()
-        if not can_login:
-            st.warning("Admin login is not set up. Add APP_ADMIN_USER and APP_ADMIN_PASSWORD to the app's Secrets.")
+        st.write(f"**Dataset file:** {dataset_name}")
 
-        st.session_state.setdefault("fails", 0)
-        if can_login and "user" not in st.session_state:
-            if st.session_state.fails >= 5:
-                st.error("Too many failed attempts in this session. Reload the page to try again.")
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric("Rows", f"{len(dataset):,}")
+        m2.metric("Columns", len(dataset.columns))
+        m3.metric(
+            "Missing values",
+            f"{int(dataset.isna().sum().sum()):,}"
+        )
+
+        st.markdown("**Preview of the dataset**")
+
+        st.dataframe(
+            dataset.head(100),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download cleaned dataset (CSV)",
+            dataset.to_csv(index=False),
+            file_name="cleaned_waste_data.csv",
+            mime="text/csv"
+        )
+
+        st.divider()
+        st.markdown("**Explore columns**")
+
+        selected_column = st.selectbox(
+            "Choose a column",
+            options=list(dataset.columns)
+        )
+
+        st.write(f"**Column:** {selected_column}")
+
+        st.write(
+            dataset[selected_column].describe(
+                include="all"
+            ).to_frame()
+        )
+
+        if pd.api.types.is_numeric_dtype(dataset[selected_column]):
+            st.markdown("**Column distribution**")
+
+            chart_data = dataset[selected_column].dropna()
+
+            if not chart_data.empty:
+                st.bar_chart(chart_data.value_counts().sort_index())
+
+        st.markdown("**Filter dataset**")
+
+        filter_column = st.selectbox(
+            "Choose a column to filter",
+            options=list(dataset.columns),
+            key="filter_column"
+        )
+
+        filter_values = (
+            dataset[filter_column]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+        if len(filter_values) <= 200:
+            selected_values = st.multiselect(
+                "Select values",
+                options=sorted(filter_values)
+            )
+
+            if selected_values:
+                filtered = dataset[
+                    dataset[filter_column].astype(str).isin(selected_values)
+                ]
             else:
-                with st.form("login"):
-                    username = st.text_input("Username")
-                    password = st.text_input("Password", type="password")
-                    submitted = st.form_submit_button("Log in")
-                if submitted:
-                    role = db.authenticate(username.strip(), password)
-                    if role:
-                        st.session_state.user, st.session_state.role, st.session_state.fails = username.strip(), role, 0
-                        st.rerun()
-                    else:
-                        st.session_state.fails += 1
-                        st.error("Wrong username or password.")
-        elif can_login:
-            c1, c2 = st.columns([3, 1])
-            c1.write(f"Logged in as **{st.session_state.user}** ({st.session_state.role})")
-            if c2.button("Log out"):
-                for key in ("user", "role"):
-                    st.session_state.pop(key, None)
-                st.rerun()
+                filtered = dataset
 
-            st.markdown("**Table `waste_readings`**")
-            st.write(f"{db.count_readings()} rows")
-            limit = st.slider("Rows to show", 10, 500, 50)
-            cols = db.READING_COLUMNS
-            st.dataframe(pd.DataFrame(db.fetch_readings(limit), columns=cols), hide_index=True)
-            st.download_button("Download all rows (CSV)",
-                               pd.DataFrame(db.fetch_readings(), columns=cols).to_csv(index=False),
-                               "waste_readings.csv", "text/csv")
+        else:
+            st.info(
+                "This column has many unique values. "
+                "Showing the unfiltered dataset."
+            )
+            filtered = dataset
 
-            if mode == "postgres" and st.session_state.role == "admin":
-                st.divider()
-                st.markdown("**User management (admin only)**")
-                st.dataframe(pd.DataFrame(db.list_users(), columns=["username", "role", "created"]), hide_index=True)
-                with st.form("new_user", clear_on_submit=True):
-                    n1, n2, n3 = st.columns(3)
-                    new_name = n1.text_input("New username")
-                    new_pw = n2.text_input("Password (8+ characters)", type="password")
-                    new_role = n3.selectbox("Role", list(db.ROLES))
-                    if st.form_submit_button("Create user"):
-                        try:
-                            db.create_user(new_name.strip(), new_pw, new_role)
-                            st.success(f"User '{new_name.strip()}' created.")
-                        except Exception as exc:
-                            st.error(f"Could not create user: {exc}")
+        st.write(f"Showing {len(filtered):,} rows.")
+
+        st.dataframe(
+            filtered.head(500),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "Download filtered data (CSV)",
+            filtered.to_csv(index=False),
+            file_name="filtered_waste_data.csv",
+            mime="text/csv"
+        )
